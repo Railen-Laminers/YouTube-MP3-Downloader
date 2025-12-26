@@ -1,0 +1,14 @@
+{
+    "watch": [
+        "index.js"
+    ],
+    "ignore": [
+        "node_modules",
+        "**/*.mp3",
+        "%TEMP%",
+        "C:\\Users\\*\\AppData\\Local\\Temp",
+        "youtube-mp3-downloads",
+        "C:\\Windows\\Temp"
+    ],
+    "delay": 1000
+}
