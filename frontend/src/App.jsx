@@ -1,49 +1,71 @@
-import React, { useState } from 'react';
-import { Search, Music, Download, Clock, User, AlertCircle } from 'lucide-react';
-
+import React, { useState, useEffect, lazy, Suspense } from 'react';
+import { Search, Music, AlertCircle } from 'lucide-react';
 const API_URL = import.meta.env.VITE_API_URL || 'http://localhost:5000/api';
+const VideoCard = lazy(() => import('./VideoCard'));
+
+function parseContentDisposition(headerValue) {
+  if (!headerValue) return null;
+  // Try RFC5987 style: filename*=UTF-8''encodedfilename
+  const fnStar = headerValue.match(/filename\*\s*=\s*([^']+?)''([^;]+)/i);
+  if (fnStar) {
+    try { return decodeURIComponent(fnStar[2]); } catch { return fnStar[2]; }
+  }
+  // Try simple filename="..."
+  const fn = headerValue.match(/filename="?(.+?)"?(\s*;|$)/i);
+  if (fn) {
+    try { return decodeURIComponent(fn[1]); } catch { return fn[1]; }
+  }
+  return null;
+}
 
 function App() {
   const [query, setQuery] = useState('');
   const [videos, setVideos] = useState([]);
   const [loading, setLoading] = useState(false);
-  const [downloading, setDownloading] = useState({});
+  const [downloading, setDownloading] = useState({}); // key -> {progress, size, downloading}
   const [error, setError] = useState('');
   const [healthStatus, setHealthStatus] = useState(null);
 
-  // Check server health on mount
-  React.useEffect(() => {
-    checkHealth();
-  }, []);
+  useEffect(() => { checkHealth(); }, []);
+
+  const fetchWithTimeout = async (url, options = {}, timeout = 15000) => {
+    const controller = new AbortController();
+    const id = setTimeout(() => controller.abort(), timeout);
+    try {
+      const res = await fetch(url, { ...options, signal: controller.signal });
+      return res;
+    } catch (err) {
+      if (err.name === 'AbortError') throw new Error('Request timed out. Your network may be slow.');
+      throw err;
+    } finally {
+      clearTimeout(id);
+    }
+  };
 
   const checkHealth = async () => {
     try {
-      const response = await fetch(`${API_URL}/health`);
+      const response = await fetchWithTimeout(`${API_URL}/health`, {}, 7000);
       if (response.ok) {
-        const data = await response.json();
-        setHealthStatus(data);
+        const data = await response.json().catch(() => null);
+        setHealthStatus(data || { status: 'OK' });
+      } else {
+        setHealthStatus({ status: 'DOWN' });
       }
     } catch (err) {
-      console.log('Health check failed, server might be starting...');
+      setHealthStatus({ status: 'UNKNOWN' });
+      console.warn('Health check failed:', err.message || err);
     }
   };
 
   const searchVideos = async (e) => {
-    e.preventDefault();
+    e?.preventDefault();
     if (!query.trim()) return;
-
-    setLoading(true);
-    setError('');
-    setVideos([]);
-
+    setLoading(true); setError(''); setVideos([]);
     try {
-      const response = await fetch(`${API_URL}/search?query=${encodeURIComponent(query)}`);
-      const data = await response.json();
-
-      if (!response.ok) {
-        throw new Error(data.error || 'Search failed');
-      }
-
+      const response = await fetchWithTimeout(`${API_URL}/search?query=${encodeURIComponent(query)}`, {}, 15000);
+      const data = await response.json().catch(() => null);
+      if (!response.ok) throw new Error((data && data.error) ? data.error : `Search failed (${response.status})`);
+      if (!data || !Array.isArray(data)) throw new Error('Unexpected response from server.');
       setVideos(data);
     } catch (err) {
       setError(err.message || 'Failed to search videos. Please try again.');
@@ -53,102 +75,108 @@ function App() {
     }
   };
 
-  const downloadMP3 = async (videoId, title) => {
-    setDownloading(prev => ({ ...prev, [videoId]: true }));
+  // Stream-download, supports progress (if Content-Length present)
+  const downloadFile = async (videoId, title, format) => {
+    const key = `${videoId}_${format}`;
+    setDownloading(prev => ({ ...prev, [key]: { downloading: true, progress: 0, size: null } }));
     setError('');
 
-    // Create abort controller for timeout
     const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 300000); // 5 minutes
+    // generous timeout (8 minutes) for large downloads
+    const timeoutId = setTimeout(() => controller.abort(), 8 * 60 * 1000);
 
     try {
-      const response = await fetch(`${API_URL}/download/${videoId}`, {
+      const response = await fetch(`${API_URL}/download/${videoId}?format=${format}`, {
         method: 'GET',
         mode: 'cors',
-        headers: {
-          'Accept': 'audio/mpeg',
-        },
         signal: controller.signal
       });
 
       clearTimeout(timeoutId);
 
       if (!response.ok) {
-        const errorData = await response.json().catch(() => ({}));
-        throw new Error(errorData.error || `Download failed (${response.status})`);
+        const errData = await response.json().catch(() => ({}));
+        throw new Error(errData.error || `Download failed (${response.status})`);
       }
 
-      // Get filename from Content-Disposition header or use video title
-      const contentDisposition = response.headers.get('Content-Disposition');
-      let filename = `${title.replace(/[^\w\s.-]/gi, '').substring(0, 50)}.mp3`;
+      // filename from header (supports urlencoded and RFC5987)
+      const cd = response.headers.get('Content-Disposition');
+      let filename = parseContentDisposition(cd) || `${title.replace(/[^\w\s.-]/gi, '').substring(0, 50)}.${format}`;
 
-      if (contentDisposition) {
-        const match = contentDisposition.match(/filename="?(.+)"?/);
-        if (match) {
-          filename = decodeURIComponent(match[1]);
-        }
+      // Read stream and build blob incrementally to show progress
+      const contentLength = response.headers.get('Content-Length');
+      const total = contentLength ? parseInt(contentLength, 10) : null;
+      if (total) {
+        setDownloading(prev => ({ ...prev, [key]: { ...prev[key], size: total } }));
       }
 
-      // Create blob from response
-      const blob = await response.blob();
-
-      // Check if blob is valid
-      if (blob.size === 0) {
-        throw new Error('Empty file received');
+      const reader = response.body.getReader();
+      const chunks = [];
+      let received = 0;
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        chunks.push(value);
+        received += value.length;
+        setDownloading(prev => ({ ...prev, [key]: { ...prev[key], downloading: true, progress: total ? Math.floor((received / total) * 100) : null, size: total } }));
       }
 
-      // Create download link
-      const url = window.URL.createObjectURL(blob);
+      // Combine and save
+      const blob = new Blob(chunks, { type: response.headers.get('Content-Type') || (format === 'mp3' ? 'audio/mpeg' : 'video/mp4') });
+      if (!blob || blob.size === 0) throw new Error('Empty file received');
+
+      const objectUrl = window.URL.createObjectURL(blob);
       const link = document.createElement('a');
-      link.href = url;
+      link.href = objectUrl;
       link.download = filename;
       document.body.appendChild(link);
       link.click();
-
-      // Cleanup
       link.remove();
-      setTimeout(() => window.URL.revokeObjectURL(url), 100);
-
-      console.log(`Downloaded: ${filename} (${blob.size} bytes)`);
-
+      setTimeout(() => window.URL.revokeObjectURL(objectUrl), 1500);
+      console.log(`Downloaded ${filename} (${blob.size} bytes)`);
     } catch (err) {
       clearTimeout(timeoutId);
-
-      if (err.name === 'AbortError') {
-        setError('Download timeout. The video might be too long or there are network issues.');
+      if (err.name === 'AbortError' || (err.message && err.message.toLowerCase().includes('timed out'))) {
+        setError('Download timeout or aborted. The file might be large or your network is slow.');
       } else {
-        setError(err.message || 'Failed to download MP3. Please try again.');
+        setError(err.message || 'Failed to download. Please try again.');
       }
-
       console.error('Download error:', err);
     } finally {
-      setDownloading(prev => ({ ...prev, [videoId]: false }));
+      setDownloading(prev => {
+        const copy = { ...prev };
+        delete copy[key];
+        return copy;
+      });
     }
   };
 
   const formatDuration = (seconds) => {
     if (!seconds) return '0:00';
-
     const hrs = Math.floor(seconds / 3600);
     const mins = Math.floor((seconds % 3600) / 60);
     const secs = Math.floor(seconds % 60);
-
-    if (hrs > 0) {
-      return `${hrs}:${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`;
-    }
-    return `${mins}:${secs.toString().padStart(2, '0')}`;
+    if (hrs > 0) return `${hrs}:${String(mins).padStart(2, '0')}:${String(secs).padStart(2, '0')}`;
+    return `${mins}:${String(secs).padStart(2, '0')}`;
   };
 
   const formatViews = (views) => {
-    if (!views) return '0 views';
-
-    if (views >= 1000000) {
-      return `${(views / 1000000).toFixed(1)}M views`;
-    } else if (views >= 1000) {
-      return `${(views / 1000).toFixed(1)}K views`;
-    }
+    if (!views && views !== 0) return '0 views';
+    if (views >= 1000000) return `${(views / 1000000).toFixed(1)}M views`;
+    if (views >= 1000) return `${(views / 1000).toFixed(1)}K views`;
     return `${views} views`;
   };
+
+  const SkeletonCard = () => (
+    <div className="skeleton-card">
+      <div className="skel-thumb shimmer"></div>
+      <div className="skel-body">
+        <div className="skel-line full shimmer"></div>
+        <div className="skel-line mid shimmer"></div>
+        <div className="skel-line short shimmer" style={{ marginTop: 8 }}></div>
+      </div>
+    </div>
+  );
 
   return (
     <div className="app">
@@ -156,162 +184,72 @@ function App() {
         <div className="logo">
           <Music size={32} />
           <div>
-            <h1>YouTube MP3 Downloader</h1>
+            <h1>YouTube Downloader</h1>
             <small>For educational purposes only</small>
           </div>
         </div>
-        {healthStatus && (
-          <div className="health-status">
-            <div className={`status-dot ${healthStatus.status === 'OK' ? 'online' : 'offline'}`}></div>
-            <span>Server: {healthStatus.status}</span>
-          </div>
-        )}
+
+        <div className="health-status" title="Server health">
+          <div className={`status-dot ${healthStatus && healthStatus.status === 'OK' ? 'online' : (healthStatus && healthStatus.status === 'DOWN' ? 'offline' : '')}`}></div>
+        </div>
       </header>
 
       <main className="main">
-        <form onSubmit={searchVideos} className="search-form">
+        <form onSubmit={searchVideos} className="search-form" role="search" aria-label="Search videos">
           <div className="search-input">
-            <Search size={20} />
+            <Search size={18} />
             <input
-              type="text"
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="Search YouTube videos..."
-              disabled={loading}
-              autoFocus
+              type="text" value={query} onChange={(e) => setQuery(e.target.value)}
+              placeholder="Search YouTube videos..." disabled={loading} autoFocus aria-label="Search query"
             />
-            {query && (
-              <button
-                type="button"
-                className="clear-btn"
-                onClick={() => setQuery('')}
-              >
-                ×
-              </button>
-            )}
+            {query && <button type="button" className="clear-btn" onClick={() => { setQuery(''); setVideos([]); }}>×</button>}
           </div>
-          <button
-            type="submit"
-            disabled={loading || !query.trim()}
-            className="search-btn"
-          >
-            {loading ? (
-              <>
-                <span className="spinner-small"></span>
-                Searching...
-              </>
-            ) : 'Search'}
+
+          <button type="submit" disabled={loading || !query.trim()} className="search-btn">
+            {loading ? 'Searching...' : 'Search'}
           </button>
         </form>
 
         {error && (
-          <div className="error-message">
-            <AlertCircle size={20} />
+          <div className="error-message" role="alert">
+            <AlertCircle size={18} />
             <span>{error}</span>
-            <button
-              className="close-error"
-              onClick={() => setError('')}
-            >
-              ×
-            </button>
+            <button className="close-error" onClick={() => setError('')}>×</button>
           </div>
         )}
 
         {videos.length > 0 && (
           <div className="results-info">
             <p>Found {videos.length} video{videos.length !== 1 ? 's' : ''}</p>
-            <button
-              className="clear-results"
-              onClick={() => setVideos([])}
-            >
-              Clear Results
-            </button>
+            <button className="clear-results" onClick={() => setVideos([])}>Clear Results</button>
           </div>
         )}
 
-        <div className="video-grid">
-          {videos.map((video) => (
-            <div key={video.id} className="video-card">
-              <div className="video-thumbnail">
-                <img
-                  src={video.thumbnail}
-                  alt={video.title}
-                  loading="lazy"
-                />
-                <div className="duration-badge">
-                  <Clock size={12} />
-                  {formatDuration(video.duration)}
-                </div>
-              </div>
-              <div className="video-info">
-                <h3 className="video-title" title={video.title}>
-                  {video.title.length > 60 ? `${video.title.substring(0, 60)}...` : video.title}
-                </h3>
-                <div className="video-meta">
-                  <span className="channel">
-                    <User size={14} />
-                    {video.channelTitle}
-                  </span>
-                  <span className="views">
-                    {formatViews(video.views)}
-                  </span>
-                  <span className="uploaded">
-                    {video.ago}
-                  </span>
-                </div>
-                <p className="video-description">
-                  {video.description ?
-                    (video.description.length > 120 ? `${video.description.substring(0, 120)}...` : video.description)
-                    : 'No description available'}
-                </p>
-                <div className="video-actions">
-                  <button
-                    onClick={() => downloadMP3(video.id, video.title)}
-                    disabled={downloading[video.id]}
-                    className="download-btn"
-                  >
-                    {downloading[video.id] ? (
-                      <>
-                        <span className="spinner"></span>
-                        Converting...
-                      </>
-                    ) : (
-                      <>
-                        <Download size={16} />
-                        Download MP3
-                      </>
-                    )}
-                  </button>
-                  <span className="file-size">
-                    Estimated: ~{Math.round(video.duration * 0.08)} MB
-                  </span>
-                </div>
-              </div>
-            </div>
+        <div className="video-grid" aria-live="polite">
+          {videos.map(video => (
+            <Suspense key={video.id} fallback={<SkeletonCard />}>
+              <VideoCard
+                video={video}
+                downloading={downloading}
+                downloadFile={downloadFile}
+                formatDuration={formatDuration}
+                formatViews={formatViews}
+              />
+            </Suspense>
           ))}
         </div>
 
         {videos.length === 0 && !loading && (
           <div className="empty-state">
             <Music size={64} />
-            <p>Search for YouTube videos to convert to MP3</p>
+            <p>Search for YouTube videos to download</p>
             <small>Enter a search term above to get started</small>
-            <div className="disclaimer-box">
-              <h4>⚠️ Important Disclaimer</h4>
-              <p>This tool is for educational purposes only. Only download content:</p>
-              <ul>
-                <li>You own the rights to</li>
-                <li>That is in the public domain</li>
-                <li>You have explicit permission to use</li>
-              </ul>
-              <p>Respect copyright laws and creators' rights.</p>
-            </div>
           </div>
         )}
 
         {loading && (
-          <div className="loading-state">
-            <div className="spinner-large"></div>
+          <div className="loading-state" aria-live="polite">
+            <div className="spinner-large" role="status" />
             <p>Searching YouTube...</p>
           </div>
         )}
@@ -320,16 +258,7 @@ function App() {
       <footer className="footer">
         <div className="footer-content">
           <p>⚠️ Educational Purpose Only | Respect Copyright Laws</p>
-          <div className="footer-links">
-            <a href="/privacy">Privacy</a>
-            <span>•</span>
-            <a href="/terms">Terms</a>
-            <span>•</span>
-            <a href="/contact">Contact</a>
-          </div>
-          <p className="copyright">
-            © {new Date().getFullYear()} YouTube MP3 Converter. Not affiliated with YouTube.
-          </p>
+          <p style={{ marginTop: 8 }} className="small">© {new Date().getFullYear()} YouTube Downloader. Not affiliated with YouTube.</p>
         </div>
       </footer>
     </div>
